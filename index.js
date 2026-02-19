@@ -15,7 +15,7 @@ import TelegramBot from 'node-telegram-bot-api';
 import express from 'express';
 import { createClient } from '@supabase/supabase-js';
 import { createPublicClient, createWalletClient, http, parseUnits, formatUnits, erc20Abi, encodeFunctionData } from 'viem';
-import { aiParseCommand, aiChat, aiParseSchedule, aiTransactionReply } from './ai.js';
+import { aiParseCommand, aiChat, aiTransactionReply } from './ai.js';
 import { findAlternateChain } from './crossChainCheck.js';
 import { base, bsc } from 'viem/chains';
 import { privateKeyToAccount } from 'viem/accounts';
@@ -113,6 +113,61 @@ async function logCmd(msg, type, amount, recipients, chain, status, profileId) {
   }, { onConflict: 'platform,platform_message_id' });
 }
 
+// ============ Schedule Detection via Edge Function ============
+
+async function parseScheduleViaEdge(text) {
+  try {
+    const { data, error } = await supabase.functions.invoke('parse-schedule', {
+      body: { text, platform: 'telegram' },
+    });
+
+    if (error) {
+      console.error('[Schedule] Edge function error:', error.message);
+      return parseSimpleScheduleFallback(text);
+    }
+
+    if (data?.hasSchedule && data.scheduledAt) {
+      return {
+        hasSchedule: true,
+        scheduledAt: data.scheduledAt,
+        command: data.command,
+        timeDescription: data.timeDescription,
+        parsed: data.parsed,
+      };
+    }
+
+    return null;
+  } catch (e) {
+    console.error('[Schedule] Edge function exception:', e.message);
+    return parseSimpleScheduleFallback(text);
+  }
+}
+
+const SIMPLE_SCHEDULE = /\b(?:in\s+(\d+)\s*(s(?:ec(?:ond)?s?)?|m(?:in(?:ute)?s?)?|h(?:(?:ou)?rs?)?|d(?:ays?)?))\s*$/i;
+
+function parseSimpleScheduleFallback(text) {
+  const match = text.match(SIMPLE_SCHEDULE);
+  if (!match) return null;
+  const value = parseInt(match[1]);
+  const unit = match[2].toLowerCase();
+  let ms = 0, unitLabel = '';
+  if (unit.startsWith('s')) { ms = value * 1000; unitLabel = 'second'; }
+  else if (unit.startsWith('m')) { ms = value * 60000; unitLabel = 'minute'; }
+  else if (unit.startsWith('h')) { ms = value * 3600000; unitLabel = 'hour'; }
+  else if (unit.startsWith('d')) { ms = value * 86400000; unitLabel = 'day'; }
+  else return null;
+  if (ms < 30000 || ms > 30 * 86400000) return null;
+  const scheduledAt = new Date(Date.now() + ms);
+  const commandText = text.replace(SIMPLE_SCHEDULE, '').trim();
+  const plural = value !== 1 ? 's' : '';
+  return {
+    hasSchedule: true,
+    scheduledAt: scheduledAt.toISOString(),
+    command: commandText.replace(/^\/(?:send|pay|monibot)\s*/i, '').replace(/^monibot\s*/i, '').trim(),
+    timeDescription: `in ${value} ${unitLabel}${plural}`,
+  };
+}
+
 // ============ Command Parsing ============
 
 function detectChain(text) {
@@ -123,8 +178,8 @@ function detectChain(text) {
 }
 
 function parseP2P(text) {
-  // Multi: "send $1 each to @a, @b"
-  const multi = text.match(/(?:send|pay)\s+\$?([\d.]+)\s*(?:\w*\s+)?each\s+to\s+((?:@\w[\w-]*(?:\s*,?\s*)?)+)/i);
+  // Multi: "send $1 each to @a, @b" or "send $1 each to @a and @b"
+  const multi = text.match(/(?:send|pay)\s+\$?([\d.]+)\s*(?:\w*\s+)?each\s+to\s+(.*)/i);
   if (multi) {
     const tags = (multi[2].match(/@(\w[\w-]*)/g) || []).map(m => m.slice(1).toLowerCase()).filter(t => t !== 'monibot');
     if (tags.length) return { type: 'p2p_multi', amount: parseFloat(multi[1]), recipients: tags, chain: detectChain(text) };
@@ -347,8 +402,8 @@ bot.on('message', async (msg) => {
   
   console.log(`[AI] NLP input from ${msg.from.username || msg.from.id}: "${cleaned.substring(0, 80)}"`);
   
-  // Check for time-aware scheduling first
-  const scheduleResult = await aiParseSchedule(cleaned, 'telegram');
+  // Check for time-aware scheduling via edge function
+  const scheduleResult = await parseScheduleViaEdge(text);
   if (scheduleResult?.hasSchedule && scheduleResult.scheduledAt && scheduleResult.command) {
     await handleScheduledCommandTg(msg, scheduleResult, cleaned);
     return;
