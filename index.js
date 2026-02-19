@@ -16,6 +16,7 @@ import express from 'express';
 import { createClient } from '@supabase/supabase-js';
 import { createPublicClient, createWalletClient, http, parseUnits, formatUnits, erc20Abi, encodeFunctionData } from 'viem';
 import { aiParseCommand, aiChat, aiParseSchedule } from './ai.js';
+import { findAlternateChain } from './crossChainCheck.js';
 import { base, bsc } from 'viem/chains';
 import { privateKeyToAccount } from 'viem/accounts';
 
@@ -191,46 +192,41 @@ bot.onText(/\/(send|pay)\s+(.+)/i, async (msg, match) => {
     if (!recipient) { results.push({ tag, ok: false, reason: 'Not found' }); continue; }
     if (recipient.id === sender.id) { results.push({ tag, ok: false, reason: 'Self-send' }); continue; }
 
-    try {
-      const { pub, wallet, config } = getClients(cmd.chain);
-      const amount = parseUnits(cmd.amount.toFixed(config.decimals), config.decimals);
-      const [nonce, balance, allowance] = await Promise.all([
-        pub.readContract({ address: config.router, abi: routerAbi, functionName: 'getNonce', args: [sender.wallet_address] }),
-        pub.readContract({ address: config.token, abi: erc20Abi, functionName: 'balanceOf', args: [sender.wallet_address] }),
-        pub.readContract({ address: config.token, abi: erc20Abi, functionName: 'allowance', args: [sender.wallet_address, config.router] }),
-      ]);
-
-      if (balance < amount) { results.push({ tag, ok: false, reason: 'Low balance' }); continue; }
-      if (allowance < amount) { results.push({ tag, ok: false, reason: 'Low allowance' }); continue; }
-
-      let calldata = encodeFunctionData({ abi: routerAbi, functionName: 'executeP2P', args: [sender.wallet_address, recipient.wallet_address, amount, nonce, `tg_${msg.message_id}_${tag}`] });
-      if (config.builder) calldata = `${calldata}${builderSuffix()}`;
-
-      const gas = await pub.estimateContractGas({ address: config.router, abi: routerAbi, functionName: 'executeP2P', args: [sender.wallet_address, recipient.wallet_address, amount, nonce, `tg_${msg.message_id}_${tag}`], account: wallet.account?.address });
-      const hash = await wallet.sendTransaction({ to: config.router, data: calldata, gas: gas + gas / 5n });
-      await pub.waitForTransactionReceipt({ hash });
-
-      const [fee] = await pub.readContract({ address: config.router, abi: routerAbi, functionName: 'calculateFee', args: [amount] });
-      const feeNum = parseFloat(formatUnits(fee, config.decimals));
-
-      await supabase.from('monibot_transactions').insert({
-        sender_id: sender.id, receiver_id: recipient.id,
-        amount: cmd.amount - feeNum, fee: feeNum, tx_hash: hash,
-        type: 'p2p_command', payer_pay_tag: sender.pay_tag, recipient_pay_tag: recipient.pay_tag,
-        chain: cmd.chain.toUpperCase(), status: 'completed', replied: true,
-      });
-
-      results.push({ tag, ok: true, hash, fee: feeNum });
-    } catch (e) {
-      results.push({ tag, ok: false, reason: e.message.split(':')[0] });
+    let activeChain = cmd.chain;
+    const result = await attemptP2POnChain(msg, sender, recipient, cmd.amount, tag, activeChain);
+    
+    if (result.ok) {
+      results.push(result);
+      continue;
     }
+    
+    // Cross-chain fallback
+    if (result.reason === 'Low balance' || result.reason === 'Low allowance') {
+      const alt = await findAlternateChain(sender.wallet_address, cmd.amount, activeChain);
+      
+      if (alt && !alt.needsAllowance) {
+        await bot.sendMessage(msg.chat.id, `🔄 Rerouting to *${alt.chain.toUpperCase()}* (${alt.balance.toFixed(2)} ${alt.symbol})...`, { parse_mode: 'Markdown' });
+        const retryResult = await attemptP2POnChain(msg, sender, recipient, cmd.amount, tag, alt.chain);
+        if (retryResult.ok) retryResult.rerouted = `${activeChain} → ${alt.chain}`;
+        results.push(retryResult);
+        continue;
+      } else if (alt && alt.needsAllowance) {
+        results.push({ tag, ok: false, reason: `Funds on ${alt.chain.toUpperCase()} but needs allowance` });
+        continue;
+      }
+    }
+    
+    results.push(result);
   }
 
   // Build reply
   const successes = results.filter(r => r.ok);
   const failures = results.filter(r => !r.ok);
   let reply = successes.length ? `✅ *${successes.length} payment(s) sent!*\n` : '';
-  successes.forEach(r => { reply += `• @${r.tag}: $${(cmd.amount - r.fee).toFixed(2)} ✓\n`; });
+  successes.forEach(r => {
+    const routeNote = r.rerouted ? ` _(${r.rerouted})_` : '';
+    reply += `• @${r.tag}: $${(cmd.amount - r.fee).toFixed(2)} ✓${routeNote}\n`;
+  });
   if (failures.length) { reply += `\n❌ *Failed:*\n`; failures.forEach(r => { reply += `• @${r.tag}: ${r.reason}\n`; }); }
 
   await bot.sendMessage(msg.chat.id, reply, { parse_mode: 'Markdown' });
@@ -410,48 +406,82 @@ async function executeP2PCommand(msg, cmd) {
     if (!recipient) { results.push({ tag, ok: false, reason: 'Not found' }); continue; }
     if (recipient.id === sender.id) { results.push({ tag, ok: false, reason: 'Self-send' }); continue; }
     
-    try {
-      const { pub, wallet, config } = getClients(cmd.chain);
-      const amount = parseUnits(cmd.amount.toFixed(config.decimals), config.decimals);
-      const [nonce, balance, allowance] = await Promise.all([
-        pub.readContract({ address: config.router, abi: routerAbi, functionName: 'getNonce', args: [sender.wallet_address] }),
-        pub.readContract({ address: config.token, abi: erc20Abi, functionName: 'balanceOf', args: [sender.wallet_address] }),
-        pub.readContract({ address: config.token, abi: erc20Abi, functionName: 'allowance', args: [sender.wallet_address, config.router] }),
-      ]);
-      
-      if (balance < amount) { results.push({ tag, ok: false, reason: 'Low balance' }); continue; }
-      if (allowance < amount) { results.push({ tag, ok: false, reason: 'Low allowance' }); continue; }
-      
-      let calldata = encodeFunctionData({ abi: routerAbi, functionName: 'executeP2P', args: [sender.wallet_address, recipient.wallet_address, amount, nonce, `tg_${msg.message_id}_${tag}`] });
-      if (config.builder) calldata = `${calldata}${builderSuffix()}`;
-      
-      const gas = await pub.estimateContractGas({ address: config.router, abi: routerAbi, functionName: 'executeP2P', args: [sender.wallet_address, recipient.wallet_address, amount, nonce, `tg_${msg.message_id}_${tag}`], account: wallet.account?.address });
-      const hash = await wallet.sendTransaction({ to: config.router, data: calldata, gas: gas + gas / 5n });
-      await pub.waitForTransactionReceipt({ hash });
-      
-      const [fee] = await pub.readContract({ address: config.router, abi: routerAbi, functionName: 'calculateFee', args: [amount] });
-      const feeNum = parseFloat(formatUnits(fee, config.decimals));
-      
-      await supabase.from('monibot_transactions').insert({
-        sender_id: sender.id, receiver_id: recipient.id,
-        amount: cmd.amount - feeNum, fee: feeNum, tx_hash: hash,
-        type: 'p2p_command', payer_pay_tag: sender.pay_tag, recipient_pay_tag: recipient.pay_tag,
-        chain: cmd.chain.toUpperCase(), status: 'completed', replied: true,
-      });
-      
-      results.push({ tag, ok: true, hash, fee: feeNum });
-    } catch (e) {
-      results.push({ tag, ok: false, reason: e.message.split(':')[0] });
+    let activeChain = cmd.chain;
+    const result = await attemptP2POnChain(msg, sender, recipient, cmd.amount, tag, activeChain);
+    
+    if (result.ok) {
+      results.push(result);
+      continue;
     }
+    
+    // Cross-chain fallback on balance/allowance errors
+    if (result.reason === 'Low balance' || result.reason === 'Low allowance') {
+      const alt = await findAlternateChain(sender.wallet_address, cmd.amount, activeChain);
+      
+      if (alt && !alt.needsAllowance) {
+        await bot.sendMessage(msg.chat.id, `🔄 Rerouting @${tag} payment to *${alt.chain.toUpperCase()}* (${alt.balance.toFixed(2)} ${alt.symbol})...`, { parse_mode: 'Markdown' });
+        const retryResult = await attemptP2POnChain(msg, sender, recipient, cmd.amount, tag, alt.chain);
+        if (retryResult.ok) retryResult.rerouted = `${activeChain} → ${alt.chain}`;
+        results.push(retryResult);
+        continue;
+      } else if (alt && alt.needsAllowance) {
+        results.push({ tag, ok: false, reason: `Funds on ${alt.chain.toUpperCase()} but needs allowance` });
+        continue;
+      }
+    }
+    
+    results.push(result);
   }
   
   const successes = results.filter(r => r.ok);
   const failures = results.filter(r => !r.ok);
   let reply = successes.length ? `✅ *${successes.length} payment(s) sent!*\n` : '';
-  successes.forEach(r => { reply += `• @${r.tag}: $${(cmd.amount - r.fee).toFixed(2)} ✓\n`; });
+  successes.forEach(r => {
+    const routeNote = r.rerouted ? ` _(routed: ${r.rerouted})_` : '';
+    reply += `• @${r.tag}: $${(cmd.amount - r.fee).toFixed(2)} ✓${routeNote}\n`;
+  });
   if (failures.length) { reply += `\n❌ *Failed:*\n`; failures.forEach(r => { reply += `• @${r.tag}: ${r.reason}\n`; }); }
   
   await bot.sendMessage(msg.chat.id, reply, { parse_mode: 'Markdown' });
+}
+
+/**
+ * Attempt a single P2P transfer on a specific chain. Returns result object.
+ */
+async function attemptP2POnChain(msg, sender, recipient, amount, tag, chainName) {
+  try {
+    const { pub, wallet, config } = getClients(chainName);
+    const amountUnits = parseUnits(amount.toFixed(config.decimals), config.decimals);
+    const [nonce, balance, allowance] = await Promise.all([
+      pub.readContract({ address: config.router, abi: routerAbi, functionName: 'getNonce', args: [sender.wallet_address] }),
+      pub.readContract({ address: config.token, abi: erc20Abi, functionName: 'balanceOf', args: [sender.wallet_address] }),
+      pub.readContract({ address: config.token, abi: erc20Abi, functionName: 'allowance', args: [sender.wallet_address, config.router] }),
+    ]);
+    
+    if (balance < amountUnits) return { tag, ok: false, reason: 'Low balance' };
+    if (allowance < amountUnits) return { tag, ok: false, reason: 'Low allowance' };
+    
+    let calldata = encodeFunctionData({ abi: routerAbi, functionName: 'executeP2P', args: [sender.wallet_address, recipient.wallet_address, amountUnits, nonce, `tg_${msg.message_id}_${tag}`] });
+    if (config.builder) calldata = `${calldata}${builderSuffix()}`;
+    
+    const gas = await pub.estimateContractGas({ address: config.router, abi: routerAbi, functionName: 'executeP2P', args: [sender.wallet_address, recipient.wallet_address, amountUnits, nonce, `tg_${msg.message_id}_${tag}`], account: wallet.account?.address });
+    const hash = await wallet.sendTransaction({ to: config.router, data: calldata, gas: gas + gas / 5n });
+    await pub.waitForTransactionReceipt({ hash });
+    
+    const [fee] = await pub.readContract({ address: config.router, abi: routerAbi, functionName: 'calculateFee', args: [amountUnits] });
+    const feeNum = parseFloat(formatUnits(fee, config.decimals));
+    
+    await supabase.from('monibot_transactions').insert({
+      sender_id: sender.id, receiver_id: recipient.id,
+      amount: amount - feeNum, fee: feeNum, tx_hash: hash,
+      type: 'p2p_command', payer_pay_tag: sender.pay_tag, recipient_pay_tag: recipient.pay_tag,
+      chain: chainName.toUpperCase(), status: 'completed', replied: true,
+    });
+    
+    return { tag, ok: true, hash, fee: feeNum };
+  } catch (e) {
+    return { tag, ok: false, reason: e.message.split(':')[0] };
+  }
 }
 
 // ============ AI-Parsed Giveaway for Telegram ============
