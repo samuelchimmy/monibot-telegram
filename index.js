@@ -1,13 +1,11 @@
 /**
- * MoniBot Telegram Bot v1.0
+ * MoniBot Telegram Bot v2.0 (AI-Powered)
  * 
- * Features:
- * - /send $5 to @alice
- * - /send $1 each to @alice, @bob
- * - /balance
- * - /link - Shows linking instructions
- * - /help
- * - /giveaway $5 to the first 5
+ * AI Features:
+ * - Natural language command parsing ("yo send 5 bucks to alice")
+ * - Conversational AI personality (answers questions about MoniPay)
+ * - Smart intent detection with regex fallback
+ * - /send, /pay, /balance, /link, /help, /giveaway
  * - Inline @monibot commands in groups
  * - Multi-chain support (Base, BSC, Tempo)
  */
@@ -17,6 +15,7 @@ import TelegramBot from 'node-telegram-bot-api';
 import express from 'express';
 import { createClient } from '@supabase/supabase-js';
 import { createPublicClient, createWalletClient, http, parseUnits, formatUnits, erc20Abi, encodeFunctionData } from 'viem';
+import { aiParseCommand, aiChat, aiParseSchedule } from './ai.js';
 import { base, bsc } from 'viem/chains';
 import { privateKeyToAccount } from 'viem/accounts';
 
@@ -125,8 +124,8 @@ function parseP2P(text) {
 // ============ Telegram Bot ============
 
 console.log('┌─────────────────────────────────────────────────┐');
-console.log('│         MoniBot Telegram Bot v1.0               │');
-console.log('│    Multi-Chain Payments in Groups               │');
+console.log('│       MoniBot Telegram Bot v2.0 (AI-Powered)    │');
+console.log('│    NLP Commands + Conversational AI              │');
 console.log('└─────────────────────────────────────────────────┘\n');
 
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
@@ -305,6 +304,284 @@ bot.onText(/\/giveaway\s+\$?([\d.]+)\s*(?:\w*\s+)?(?:to\s+)?(?:the\s+)?(?:first\
   bot.on('message', handler);
   setTimeout(() => { bot.removeListener('message', handler); }, 600000);
 });
+
+// ============ AI-Powered Natural Language Handler ============
+// Catches messages that mention @monibot or reply to bot but don't match slash commands
+
+bot.on('message', async (msg) => {
+  if (!msg.text) return;
+  const text = msg.text.trim();
+  
+  // Skip slash commands (handled above) and bot's own messages
+  if (text.startsWith('/')) return;
+  if (msg.from?.is_bot) return;
+  
+  // Only respond if mentioned or in private chat or replying to bot
+  const isMentioned = text.toLowerCase().includes('@monibot') || text.toLowerCase().includes('monibot');
+  const isPrivate = msg.chat.type === 'private';
+  const isReplyToBot = msg.reply_to_message?.from?.id === bot.options?.polling?.params?.id;
+  
+  if (!isMentioned && !isPrivate && !isReplyToBot) return;
+  
+  // Clean the text
+  const cleaned = text.replace(/@monibot/gi, '').replace(/monibot/gi, '').trim();
+  if (!cleaned) return;
+  
+  // Deduplication
+  if (await isProcessed(msg.message_id)) return;
+  
+  console.log(`[AI] NLP input from ${msg.from.username || msg.from.id}: "${cleaned.substring(0, 80)}"`);
+  
+  // Check for time-aware scheduling first
+  const scheduleResult = await aiParseSchedule(cleaned, 'telegram');
+  if (scheduleResult?.hasSchedule && scheduleResult.scheduledAt && scheduleResult.command) {
+    await handleScheduledCommandTg(msg, scheduleResult, cleaned);
+    return;
+  }
+  
+  // Try regex first (fast path)
+  const regexCmd = parseP2P(cleaned);
+  if (regexCmd) {
+    await executeP2PCommand(msg, regexCmd);
+    return;
+  }
+  
+  // Try AI parsing
+  const aiResult = await aiParseCommand(cleaned, 'telegram');
+  
+  if (aiResult && aiResult.type && aiResult.type !== 'chat') {
+    if (aiResult.type === 'balance') {
+      const profile = await getProfileByTelegramId(msg.from.id);
+      if (!profile) { await bot.sendMessage(msg.chat.id, '❌ Not linked. Use /link first.'); return; }
+      const chain = aiResult.chain || profile.preferred_network || 'base';
+      const { pub, config } = getClients(chain);
+      const bal = await pub.readContract({ address: config.token, abi: erc20Abi, functionName: 'balanceOf', args: [profile.wallet_address] });
+      await bot.sendMessage(msg.chat.id, `💰 *${parseFloat(formatUnits(bal, config.decimals)).toFixed(2)} ${config.symbol}* on ${chain.charAt(0).toUpperCase() + chain.slice(1)}`, { parse_mode: 'Markdown' });
+      return;
+    }
+    
+    if (aiResult.type === 'help') {
+      bot.emit('text', msg);
+      return;
+    }
+    
+    if (aiResult.type === 'link') {
+      const profile = await getProfileByTelegramId(msg.from.id);
+      if (profile) {
+        await bot.sendMessage(msg.chat.id, `✅ Already linked to *@${profile.pay_tag}*`, { parse_mode: 'Markdown' });
+      } else {
+        await bot.sendMessage(msg.chat.id, `🔗 Link at [monipay.lovable.app](https://monipay.lovable.app) → Settings → MoniBot AI → Link Telegram`, { parse_mode: 'Markdown', disable_web_page_preview: true });
+      }
+      return;
+    }
+    
+    // AI-parsed giveaway
+    if (aiResult.type === 'giveaway' && aiResult.amount && aiResult.maxParticipants) {
+      await handleGiveawayTg(msg, aiResult.amount, aiResult.maxParticipants, aiResult.chain || 'base');
+      return;
+    }
+    
+    if ((aiResult.type === 'p2p' || aiResult.type === 'p2p_multi') && aiResult.amount && aiResult.recipients?.length) {
+      await executeP2PCommand(msg, { type: aiResult.type, amount: aiResult.amount, recipients: aiResult.recipients, chain: aiResult.chain || 'base' });
+      return;
+    }
+  }
+  
+  // Conversational AI fallback
+  const chatReply = await aiChat(cleaned, msg.from.username || msg.from.first_name, 'telegram');
+  if (chatReply) {
+    await bot.sendMessage(msg.chat.id, chatReply, { parse_mode: 'Markdown' });
+  } else {
+    await bot.sendMessage(msg.chat.id, "I'm MoniBot! 💸 Try `/help` to see what I can do.", { parse_mode: 'Markdown' });
+  }
+});
+
+// ============ Shared P2P Execution ============
+
+async function executeP2PCommand(msg, cmd) {
+  const sender = await getProfileByTelegramId(msg.from.id);
+  if (!sender) { await bot.sendMessage(msg.chat.id, '❌ Not linked. Use /link first.'); return; }
+  
+  await logCmd(msg, cmd.type, cmd.amount, cmd.recipients, cmd.chain, 'processing', sender.id);
+  
+  const results = [];
+  for (const tag of cmd.recipients) {
+    const recipient = await getProfileByMonitag(tag);
+    if (!recipient) { results.push({ tag, ok: false, reason: 'Not found' }); continue; }
+    if (recipient.id === sender.id) { results.push({ tag, ok: false, reason: 'Self-send' }); continue; }
+    
+    try {
+      const { pub, wallet, config } = getClients(cmd.chain);
+      const amount = parseUnits(cmd.amount.toFixed(config.decimals), config.decimals);
+      const [nonce, balance, allowance] = await Promise.all([
+        pub.readContract({ address: config.router, abi: routerAbi, functionName: 'getNonce', args: [sender.wallet_address] }),
+        pub.readContract({ address: config.token, abi: erc20Abi, functionName: 'balanceOf', args: [sender.wallet_address] }),
+        pub.readContract({ address: config.token, abi: erc20Abi, functionName: 'allowance', args: [sender.wallet_address, config.router] }),
+      ]);
+      
+      if (balance < amount) { results.push({ tag, ok: false, reason: 'Low balance' }); continue; }
+      if (allowance < amount) { results.push({ tag, ok: false, reason: 'Low allowance' }); continue; }
+      
+      let calldata = encodeFunctionData({ abi: routerAbi, functionName: 'executeP2P', args: [sender.wallet_address, recipient.wallet_address, amount, nonce, `tg_${msg.message_id}_${tag}`] });
+      if (config.builder) calldata = `${calldata}${builderSuffix()}`;
+      
+      const gas = await pub.estimateContractGas({ address: config.router, abi: routerAbi, functionName: 'executeP2P', args: [sender.wallet_address, recipient.wallet_address, amount, nonce, `tg_${msg.message_id}_${tag}`], account: wallet.account?.address });
+      const hash = await wallet.sendTransaction({ to: config.router, data: calldata, gas: gas + gas / 5n });
+      await pub.waitForTransactionReceipt({ hash });
+      
+      const [fee] = await pub.readContract({ address: config.router, abi: routerAbi, functionName: 'calculateFee', args: [amount] });
+      const feeNum = parseFloat(formatUnits(fee, config.decimals));
+      
+      await supabase.from('monibot_transactions').insert({
+        sender_id: sender.id, receiver_id: recipient.id,
+        amount: cmd.amount - feeNum, fee: feeNum, tx_hash: hash,
+        type: 'p2p_command', payer_pay_tag: sender.pay_tag, recipient_pay_tag: recipient.pay_tag,
+        chain: cmd.chain.toUpperCase(), status: 'completed', replied: true,
+      });
+      
+      results.push({ tag, ok: true, hash, fee: feeNum });
+    } catch (e) {
+      results.push({ tag, ok: false, reason: e.message.split(':')[0] });
+    }
+  }
+  
+  const successes = results.filter(r => r.ok);
+  const failures = results.filter(r => !r.ok);
+  let reply = successes.length ? `✅ *${successes.length} payment(s) sent!*\n` : '';
+  successes.forEach(r => { reply += `• @${r.tag}: $${(cmd.amount - r.fee).toFixed(2)} ✓\n`; });
+  if (failures.length) { reply += `\n❌ *Failed:*\n`; failures.forEach(r => { reply += `• @${r.tag}: ${r.reason}\n`; }); }
+  
+  await bot.sendMessage(msg.chat.id, reply, { parse_mode: 'Markdown' });
+}
+
+// ============ AI-Parsed Giveaway for Telegram ============
+
+async function handleGiveawayTg(msg, amount, maxPeople, chain) {
+  const sender = await getProfileByTelegramId(msg.from.id);
+  if (!sender) { await bot.sendMessage(msg.chat.id, '❌ Not linked. Use /link first.'); return; }
+
+  await bot.sendMessage(msg.chat.id, `🎁 *Giveaway by @${sender.pay_tag}!*\n\n💰 *$${amount}* each to the first *${maxPeople}* people!\n\n👇 Drop your @MoniTag below to claim!`, { parse_mode: 'Markdown' });
+
+  let claimed = 0;
+  const claimedUsers = new Set();
+
+  const handler = async (reply) => {
+    if (reply.chat.id !== msg.chat.id || claimed >= maxPeople) return;
+    if (reply.from.bot || claimedUsers.has(reply.from.id)) return;
+
+    const tagMatch = reply.text?.match(/@(\w[\w-]*)/);
+    if (!tagMatch) return;
+    const claimTag = tagMatch[1].toLowerCase();
+    if (claimTag === 'monibot') return;
+
+    const recipient = await getProfileByMonitag(claimTag);
+    if (!recipient || recipient.id === sender.id) return;
+
+    claimedUsers.add(reply.from.id);
+    claimed++;
+
+    try {
+      const { pub, wallet, config } = getClients(chain);
+      const amt = parseUnits(amount.toFixed(config.decimals), config.decimals);
+      const [nonce, bal, allow] = await Promise.all([
+        pub.readContract({ address: config.router, abi: routerAbi, functionName: 'getNonce', args: [sender.wallet_address] }),
+        pub.readContract({ address: config.token, abi: erc20Abi, functionName: 'balanceOf', args: [sender.wallet_address] }),
+        pub.readContract({ address: config.token, abi: erc20Abi, functionName: 'allowance', args: [sender.wallet_address, config.router] }),
+      ]);
+
+      if (bal < amt || allow < amt) {
+        await bot.sendMessage(msg.chat.id, '❌ Giveaway ended — insufficient funds.');
+        bot.removeListener('message', handler);
+        return;
+      }
+
+      let cd = encodeFunctionData({ abi: routerAbi, functionName: 'executeP2P', args: [sender.wallet_address, recipient.wallet_address, amt, nonce, `tg_giveaway_${msg.message_id}_${claimed}`] });
+      if (config.builder) cd = `${cd}${builderSuffix()}`;
+
+      const gas = await pub.estimateContractGas({ address: config.router, abi: routerAbi, functionName: 'executeP2P', args: [sender.wallet_address, recipient.wallet_address, amt, nonce, `tg_giveaway_${msg.message_id}_${claimed}`], account: wallet.account?.address });
+      const hash = await wallet.sendTransaction({ to: config.router, data: cd, gas: gas + gas / 5n });
+      await pub.waitForTransactionReceipt({ hash });
+
+      await supabase.from('monibot_transactions').insert({
+        sender_id: sender.id, receiver_id: recipient.id,
+        amount: amount, fee: 0, tx_hash: hash,
+        type: 'p2p_command', payer_pay_tag: sender.pay_tag, recipient_pay_tag: recipient.pay_tag,
+        chain: chain.toUpperCase(), status: 'completed', replied: true,
+      });
+
+      await bot.sendMessage(msg.chat.id, `✅ *$${amount}* sent to *@${recipient.pay_tag}*! (${claimed}/${maxPeople})`, { parse_mode: 'Markdown' });
+
+      if (claimed >= maxPeople) {
+        await bot.sendMessage(msg.chat.id, '🎁 *Giveaway complete!* All spots filled.', { parse_mode: 'Markdown' });
+        bot.removeListener('message', handler);
+      }
+    } catch (e) {
+      claimedUsers.delete(reply.from.id);
+      claimed--;
+      console.error('Giveaway error:', e.message);
+    }
+  };
+
+  bot.on('message', handler);
+  setTimeout(() => { bot.removeListener('message', handler); }, 600000);
+}
+
+// ============ Scheduled Command Handler ============
+
+async function handleScheduledCommandTg(msg, scheduleResult, originalText) {
+  const sender = await getProfileByTelegramId(msg.from.id);
+  if (!sender) { await bot.sendMessage(msg.chat.id, '❌ Not linked. Use /link first.'); return; }
+
+  const scheduledAt = new Date(scheduleResult.scheduledAt);
+  if (scheduledAt <= new Date()) {
+    await bot.sendMessage(msg.chat.id, '⏰ That time is in the past. Please specify a future time.');
+    return;
+  }
+
+  // Parse the underlying command
+  const innerCmd = parseP2P(scheduleResult.command);
+  let aiCmd = null;
+  if (!innerCmd) {
+    const aiResult = await aiParseCommand(scheduleResult.command, 'telegram');
+    if (aiResult && aiResult.type && aiResult.type !== 'chat' && aiResult.type !== 'help' && aiResult.type !== 'link' && aiResult.type !== 'balance') {
+      aiCmd = aiResult;
+    }
+  }
+
+  const cmd = innerCmd || aiCmd;
+  if (!cmd) {
+    await bot.sendMessage(msg.chat.id, '❌ I can only schedule payment commands. Try: `monibot send $5 to @alice tomorrow at 3pm`', { parse_mode: 'Markdown' });
+    return;
+  }
+
+  const { data: job, error } = await supabase.from('scheduled_jobs').insert({
+    type: cmd.type === 'giveaway' ? 'scheduled_giveaway' : 'scheduled_p2p',
+    scheduled_at: scheduledAt.toISOString(),
+    payload: {
+      platform: 'telegram',
+      chatId: msg.chat.id,
+      senderId: sender.id,
+      senderPayTag: sender.pay_tag,
+      senderWallet: sender.wallet_address,
+      command: cmd,
+      originalText,
+    },
+    status: 'pending',
+    source_author_id: String(msg.from.id),
+    source_author_username: msg.from.username || msg.from.first_name,
+    source_tweet_id: String(msg.message_id),
+  }).select().maybeSingle();
+
+  if (error) console.error('❌ Failed to schedule:', error.message);
+
+  const timeDesc = scheduleResult.timeDescription || scheduledAt.toUTCString();
+  const ts = Math.floor(scheduledAt.getTime() / 1000);
+
+  await bot.sendMessage(msg.chat.id, 
+    `⏰ *Command Scheduled!*\n\n📋 *Command:* ${scheduleResult.command}\n🕐 *When:* ${timeDesc}\n✅ *Status:* ${job ? 'Queued' : 'Failed to queue'}\n\n_Job ID: ${job?.id || 'N/A'}_`,
+    { parse_mode: 'Markdown' }
+  );
+}
 
 // ============ Auto-Restart ============
 
