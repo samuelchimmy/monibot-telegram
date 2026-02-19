@@ -15,7 +15,7 @@ import TelegramBot from 'node-telegram-bot-api';
 import express from 'express';
 import { createClient } from '@supabase/supabase-js';
 import { createPublicClient, createWalletClient, http, parseUnits, formatUnits, erc20Abi, encodeFunctionData } from 'viem';
-import { aiParseCommand, aiChat, aiParseSchedule } from './ai.js';
+import { aiParseCommand, aiChat, aiParseSchedule, aiTransactionReply } from './ai.js';
 import { findAlternateChain } from './crossChainCheck.js';
 import { base, bsc } from 'viem/chains';
 import { privateKeyToAccount } from 'viem/accounts';
@@ -46,10 +46,12 @@ function builderSuffix() {
 // ============ Chain Configs ============
 
 const CHAINS = {
-  base: { chain: base, rpc: process.env.BASE_RPC_URL || 'https://mainnet.base.org', router: '0xBEE37c2f3Ce9a48D498FC0D47629a1E10356A516', token: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', decimals: 6, symbol: 'USDC', builder: true },
-  bsc: { chain: bsc, rpc: 'https://bsc-dataseed.binance.org', router: '0x9EED16952D734dFC84b7C4e75e9A3228B42D832E', token: '0x55d398326f99059fF775485246999027B3197955', decimals: 18, symbol: 'USDT', builder: false },
-  tempo: { chain: { id: 42431, name: 'Tempo', nativeCurrency: { name: 'USD', symbol: 'USD', decimals: 18 }, rpcUrls: { default: { http: ['https://rpc.moderato.tempo.xyz'] } } }, rpc: process.env.TEMPO_RPC_URL || 'https://rpc.moderato.tempo.xyz', router: '0x78A824fDE7Ee3E69B2e2Ee52d1136EECD76749fc', token: '0x20c0000000000000000000000000000000000001', decimals: 6, symbol: 'αUSD', builder: false },
+  base: { chain: base, rpcs: [process.env.BASE_RPC_URL, 'https://base-rpc.publicnode.com', 'https://base.drpc.org', 'https://mainnet.base.org'].filter(Boolean), router: '0xBEE37c2f3Ce9a48D498FC0D47629a1E10356A516', token: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', decimals: 6, symbol: 'USDC', builder: true },
+  bsc: { chain: bsc, rpcs: ['https://bsc-dataseed.binance.org', 'https://bsc-rpc.publicnode.com', 'https://bsc-dataseed1.defibit.io'], router: '0x9EED16952D734dFC84b7C4e75e9A3228B42D832E', token: '0x55d398326f99059fF775485246999027B3197955', decimals: 18, symbol: 'USDT', builder: false },
+  tempo: { chain: { id: 42431, name: 'Tempo', nativeCurrency: { name: 'USD', symbol: 'USD', decimals: 18 }, rpcUrls: { default: { http: ['https://rpc.moderato.tempo.xyz'] } } }, rpcs: [process.env.TEMPO_RPC_URL, 'https://rpc.moderato.tempo.xyz'].filter(Boolean), router: '0x78A824fDE7Ee3E69B2e2Ee52d1136EECD76749fc', token: '0x20c0000000000000000000000000000000000001', decimals: 6, symbol: 'αUSD', builder: false },
 };
+
+const rpcIndexes = { base: 0, bsc: 0, tempo: 0 };
 
 const routerAbi = [
   { name: 'executeP2P', type: 'function', stateMutability: 'nonpayable', inputs: [{ name: 'from', type: 'address' }, { name: 'to', type: 'address' }, { name: 'amount', type: 'uint256' }, { name: 'nonce', type: 'uint256' }, { name: 'tweetId', type: 'string' }], outputs: [{ name: '', type: 'bool' }] },
@@ -59,11 +61,22 @@ const routerAbi = [
 
 function getClients(chain) {
   const c = CHAINS[chain];
+  const rpcIdx = Math.min(rpcIndexes[chain] || 0, c.rpcs.length - 1);
+  const rpc = c.rpcs[rpcIdx];
   return {
-    pub: createPublicClient({ chain: c.chain, transport: http(c.rpc, { retryCount: 3 }) }),
-    wallet: createWalletClient({ account: privateKeyToAccount(process.env.MONIBOT_PRIVATE_KEY), chain: c.chain, transport: http(c.rpc, { retryCount: 3 }) }),
+    pub: createPublicClient({ chain: c.chain, transport: http(rpc, { retryCount: 3 }) }),
+    wallet: createWalletClient({ account: privateKeyToAccount(process.env.MONIBOT_PRIVATE_KEY), chain: c.chain, transport: http(rpc, { retryCount: 3 }) }),
     config: c,
   };
+}
+
+function rotateRpc(chain) {
+  const c = CHAINS[chain];
+  if (!c) return;
+  if ((rpcIndexes[chain] || 0) < c.rpcs.length - 1) {
+    rpcIndexes[chain] = (rpcIndexes[chain] || 0) + 1;
+    console.log(`  🔁 RPC failover [${chain}] → ${c.rpcs[rpcIndexes[chain]]}`);
+  }
 }
 
 // ============ DB Helpers ============
@@ -282,7 +295,13 @@ bot.onText(/\/giveaway\s+\$?([\d.]+)\s*(?:\w*\s+)?(?:to\s+)?(?:the\s+)?(?:first\
 
       const gas = await pub.estimateContractGas({ address: config.router, abi: routerAbi, functionName: 'executeP2P', args: [sender.wallet_address, recipient.wallet_address, amt, nonce, `tg_giveaway_${msg.message_id}_${claimed}`], account: wallet.account?.address });
       const hash = await wallet.sendTransaction({ to: config.router, data: cd, gas: gas + gas / 5n });
-      await pub.waitForTransactionReceipt({ hash });
+      const receipt = await pub.waitForTransactionReceipt({ hash });
+      if (receipt.status === 'reverted') {
+        claimedUsers.delete(reply.from.id);
+        claimed--;
+        await bot.sendMessage(msg.chat.id, `Transaction for @${recipient.pay_tag} was reverted on-chain.`);
+        return;
+      }
 
       await bot.sendMessage(msg.chat.id, `✅ *$${amount}* sent to *@${recipient.pay_tag}*! (${claimed}/${maxPeople})`, { parse_mode: 'Markdown' });
 
@@ -433,6 +452,45 @@ async function executeP2PCommand(msg, cmd) {
     results.push(result);
   }
   
+  // Build AI-powered natural language reply
+  if (results.length === 1 && results[0].ok) {
+    const r = results[0];
+    const aiReply = await aiTransactionReply({
+      type: r.rerouted ? 'p2p_rerouted' : 'p2p_success',
+      amount: cmd.amount - r.fee,
+      fee: r.fee,
+      symbol: CHAINS[r.rerouted ? r.rerouted.split(' → ')[1] : cmd.chain]?.symbol || 'USDC',
+      recipient: r.tag,
+      sender: sender.pay_tag,
+      chain: r.rerouted ? r.rerouted.split(' → ')[1] : cmd.chain,
+      originalChain: r.rerouted ? r.rerouted.split(' → ')[0] : undefined,
+      txHash: r.hash,
+    });
+    await bot.sendMessage(msg.chat.id, aiReply || `Sent $${(cmd.amount - r.fee).toFixed(2)} to @${r.tag}. TX: \`${r.hash.substring(0, 18)}...\``, { parse_mode: 'Markdown' });
+    return;
+  }
+
+  if (results.length === 1 && !results[0].ok) {
+    const r = results[0];
+    let failType = 'error_generic';
+    if (r.reason === 'Low balance') failType = 'error_balance';
+    else if (r.reason === 'Low allowance') failType = 'error_allowance';
+    else if (r.reason?.includes('reverted')) failType = 'error_reverted';
+    else if (r.reason === 'Not found') failType = 'error_not_found';
+    
+    const aiReply = await aiTransactionReply({ type: failType, sender: sender.pay_tag, recipient: r.tag, amount: cmd.amount, chain: cmd.chain });
+    const fallbacks = {
+      error_balance: `Your balance is too low to send $${cmd.amount}. Fund your wallet at monipay.lovable.app`,
+      error_allowance: `You need to set your MoniBot allowance first. Go to monipay.lovable.app → Settings → MoniBot AI`,
+      error_reverted: `The transaction was submitted but reverted on-chain. Please try again.`,
+      error_not_found: `@${r.tag} isn't registered on MoniPay yet. They can sign up at monipay.lovable.app`,
+      error_generic: `Something went wrong sending to @${r.tag}. Please try again.`,
+    };
+    await bot.sendMessage(msg.chat.id, aiReply || fallbacks[failType], { parse_mode: 'Markdown' });
+    return;
+  }
+
+  // Multi-recipient summary
   const successes = results.filter(r => r.ok);
   const failures = results.filter(r => !r.ok);
   let reply = successes.length ? `✅ *${successes.length} payment(s) sent!*\n` : '';
@@ -465,8 +523,8 @@ async function attemptP2POnChain(msg, sender, recipient, amount, tag, chainName)
     if (config.builder) calldata = `${calldata}${builderSuffix()}`;
     
     const gas = await pub.estimateContractGas({ address: config.router, abi: routerAbi, functionName: 'executeP2P', args: [sender.wallet_address, recipient.wallet_address, amountUnits, nonce, `tg_${msg.message_id}_${tag}`], account: wallet.account?.address });
-    const hash = await wallet.sendTransaction({ to: config.router, data: calldata, gas: gas + gas / 5n });
-    await pub.waitForTransactionReceipt({ hash });
+      const receipt = await pub.waitForTransactionReceipt({ hash });
+      if (receipt.status === 'reverted') return { tag, ok: false, reason: 'Transaction reverted on-chain' };
     
     const [fee] = await pub.readContract({ address: config.router, abi: routerAbi, functionName: 'calculateFee', args: [amountUnits] });
     const feeNum = parseFloat(formatUnits(fee, config.decimals));
@@ -530,8 +588,13 @@ async function handleGiveawayTg(msg, amount, maxPeople, chain) {
 
       const gas = await pub.estimateContractGas({ address: config.router, abi: routerAbi, functionName: 'executeP2P', args: [sender.wallet_address, recipient.wallet_address, amt, nonce, `tg_giveaway_${msg.message_id}_${claimed}`], account: wallet.account?.address });
       const hash = await wallet.sendTransaction({ to: config.router, data: cd, gas: gas + gas / 5n });
-      await pub.waitForTransactionReceipt({ hash });
-
+      const receipt = await pub.waitForTransactionReceipt({ hash });
+      if (receipt.status === 'reverted') {
+        claimedUsers.delete(reply.from.id);
+        claimed--;
+        await bot.sendMessage(msg.chat.id, `Transaction for @${recipient.pay_tag} was reverted. Skipping.`);
+        return;
+      }
       await supabase.from('monibot_transactions').insert({
         sender_id: sender.id, receiver_id: recipient.id,
         amount: amount, fee: 0, tx_hash: hash,
