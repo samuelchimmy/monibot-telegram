@@ -82,3 +82,19 @@ export async function aiParseSchedule(text, platform = 'telegram') {
     return null;
   }
 }
+
+/**
+ * Generate an AI-powered reply for a transaction result.
+ */
+export async function aiTransactionReply(txContext) {
+  try {
+    const { data, error } = await supabase.functions.invoke('monibot-ai', {
+      body: { action: 'generate-reply', context: txContext },
+    });
+
+    if (error) return null;
+    return data?.text || null;
+  } catch {
+    return null;
+  }
+}
